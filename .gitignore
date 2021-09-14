@@ -1,0 +1,5 @@
+example
+*.o
+*.swp
+db.sqlite
+.ccls-cache
