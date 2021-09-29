@@ -1,3 +1,5 @@
+#define _DEFAULT_SOURCE
+
 #include <stddef.h>
 #include <syslog.h>
 #include <string.h>
@@ -9,6 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 
 #define EXAMPLE_SENTINEL 8090
 #define EXAMPLE_AGG_F_SENTINEL 8091
@@ -55,6 +58,7 @@ static const char example_schema_full[] =
         "foreign key (deviceid, outputid) references outputs(deviceid, outputid),"
         "primary key (deviceid, outputid, groupid)"
     ") without rowid;"
+
     "pragma user_version = 1;"
 
     "commit;";
@@ -68,6 +72,7 @@ static const char example_memory_schema[] =
     "create table state.measured ("
         "deviceid text not null check (length(deviceid)==12),"
         "outputid int not null check (0 <= outputid),"
+        "timestamp int not null default (now_monotonic()),"
         "state bool not null,"
         "level int,"
         "primary key (deviceid, outputid)"
@@ -140,6 +145,43 @@ void example_agg_f_final (
     struct example_agg_f_s * agg = sqlite3_aggregate_context(ctx, sizeof(struct example_agg_f_s));
     sqlite3_result_blob(ctx, agg, sizeof(struct example_agg_f_s), SQLITE_TRANSIENT);
     return;
+}
+
+
+// custom ordinary function
+void example_now_monotonic (
+    sqlite3_context * ctx,
+    int argc,
+    sqlite3_value ** argv
+)
+{
+
+    int ret = 0;
+
+    struct timespec tp = {0};
+
+    ret = clock_gettime(CLOCK_MONOTONIC, &tp);
+    if (-1 == ret) {
+        syslog(LOG_ERR, "%s:%d:%s: clock_gettime: %s", __FILE__, __LINE__, __func__, strerror(errno));
+        sqlite3_result_error(ctx, "clock_gettime returned -1", strlen("clock_gettime returned -1"));
+        return;
+    }
+
+    // This value contains 16 bits of second precision (rolls over every 65535
+    // seconds), and 16 bits of sub-second precision (more then millisecond
+    // precision, less then microsecond).
+    uint64_t time = (tp.tv_sec & 0xffffffff);
+    time <<= 32;
+    time |= (tp.tv_nsec & 0xffffffff);
+
+    sqlite3_result_int64(
+        /* context = */ ctx,
+        /* int = */ time
+    );
+
+    return;
+    (void)argc;
+    (void)argv;
 }
 
 
@@ -309,7 +351,35 @@ int example_init_custom_agg_function (
     );
     if (SQLITE_OK != ret) {
         syslog(LOG_ERR, "%s:%d:%s: sqlite3_create_function_v2 returned %d: %s"
-                , __FILE__, __LINE__, __func__, ret, sqlite3_errstr(ret));
+                , __FILE__, __LINE__, __func__, ret, sqlite3_errmsg(example->db));
+        return -1;
+    }
+
+    return 0;
+}
+
+
+int example_init_custom_now_monotonic_function (
+    struct example_s * example
+)
+{
+
+    int ret = 0;
+
+    ret = sqlite3_create_function_v2(
+        /* db = */ example->db,
+        /* function_name = */ "now_monotonic",
+        /* num_args = */ 0,
+        /* flags = */ SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+        /* user_data = */ example,
+        /* func = */ example_now_monotonic,
+        /* step = */ NULL,
+        /* final = */ NULL,
+        /* destroy = */ NULL
+    );
+    if (SQLITE_OK != ret) {
+        syslog(LOG_ERR, "%s:%d:%s: sqlite3_create_function_v2 returned %d: %s"
+                , __FILE__, __LINE__, __func__, ret, sqlite3_errmsg(example->db));
         return -1;
     }
 
@@ -439,7 +509,7 @@ int example_device_new (
     ret = sqlite3_step(stmt);
     if (SQLITE_DONE != ret) {
         syslog(LOG_ERR, "%s:%d:%s: sqlite3_step returned %d: %s",
-                __FILE__, __LINE__, __func__, ret, sqlite3_errstr(ret));
+                __FILE__, __LINE__, __func__, ret, sqlite3_errmsg(example->db));
         return -1;
     }
 
@@ -504,6 +574,36 @@ int example_custom_aggregate_query (
 }
 
 
+int example_serialize (
+    struct example_s * example
+)
+{
+
+    int ret = 0;
+
+    uint8_t * db;
+    sqlite3_int64 db_len = 0;
+
+    db = sqlite3_serialize(
+        /* db = */ example->db,
+        /* schema = */ "main",
+        /* db_len = */ &db_len,
+        /* flags = */ 0
+    );
+    if (-1 == db_len) {
+        syslog(LOG_ERR, "%s:%d:%s: sqlite3_serialize returned -1", __FILE__, __LINE__, __func__);
+        return -1;
+    }
+
+    printf("db_len=%lld\n", db_len);
+
+    // compress (db, db_len) using something
+
+    // send (db, db_len) somewhere
+
+    return 0;
+}
+
 
 int main (
     int argc,
@@ -537,7 +637,16 @@ int main (
         return -1;
     }
 
+
+    ret = example_serialize(&example);
+    if (-1 == ret) {
+        syslog(LOG_ERR, "%s:%d:%s: example_serialize returned -1", __FILE__, __LINE__, __func__);
+        return -1;
+    }
+
     syslog(LOG_INFO, "%s:%d:%s: ok", __FILE__, __LINE__, __func__);
 
     return 0;
+    (void)argc;
+    (void)argv;
 }
